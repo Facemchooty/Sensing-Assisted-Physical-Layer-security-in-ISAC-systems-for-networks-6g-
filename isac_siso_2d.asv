@@ -1,0 +1,628 @@
+%% ISAC SISO 2D Simulation 
+clear; clc; close all;
+
+%% Constants
+c  = 3e8;
+fc = 28e9;
+lambda = c/fc;
+
+%% Room 2D
+room.L = 40;
+room.W = 20;
+
+%% Base stations (2D)
+BS(1).pos = [0; room.W/2];
+BS(2).pos = [room.L; room.W/2];
+
+%% OFDM parameters
+
+deltaF = 120e3;      % 120 kHz subcarrier spacing
+Nfft   = 4096;       % Fs = 491.52 MHz
+Fs     = deltaF*Nfft;
+
+cpLen  = 288;        % ~7% CP
+Nsc    = 3072;       % active subcarriers (fits inside Nfft)
+M      = 16;
+NsSym  = 6;          % μειωμένο για να τρέχει (μπορείς να το ανεβάσεις μετά)
+
+scIdx   = (-Nsc/2:Nsc/2-1).';
+fftBins = mod(scIdx + Nfft/2, Nfft) + 1;
+
+%deltaF = 15e3;         % subcarrier spacing
+%Fs = deltaF * Nfft;    % sampling rate (consistent)
+
+%% Time
+Tframe = 1e-3;
+Nsteps = 200;
+
+%% Users (moving)
+Nu = 2;
+for u=1:Nu
+    users(u).pos = [room.L*(0.2+0.6*rand); room.W*rand];
+    users(u).vel = 1.0 * randn(2,1);
+end
+
+%% Objects (moving reflectors)
+No = 3;
+for o=1:No
+    obj(o).pos = [room.L*rand; room.W*rand];
+    obj(o).vel = 0.5 * randn(2,1);
+    obj(o).rcs = 1;
+end
+
+%% 360° beam pattern (NOT MIMO beamforming, just sector gain)
+Nbeams = 36;
+azGrid = linspace(-180,180,Nbeams+1); azGrid(end)=[];
+beamwidthDeg = 20;
+Gmain_dB = 18;
+Gside_dB = -5;
+
+%% SNR
+SNRdB = 15;
+
+%% Logs
+
+berLog        = zeros(Nsteps,2,Nu);
+rangeEstLog   = nan(Nsteps,2,No);
+rangeObjLog   = zeros(Nsteps,2,No);
+aoaObjLog     = zeros(Nsteps,2,No);
+fdMonoLog     = zeros(Nsteps,2,No);
+wallRangeLog  = zeros(Nsteps,2);
+slowZ = nan(Nsteps,2,No);   % complex slow-time sample per (t, BS, obj)
+fdHatLog = nan(Nsteps,2,No); % Doppler estimate (Hz)
+
+% --- NEW logs for scanning AoA + localization ---
+aoaHatUserLog = nan(Nsteps,2,Nu);   % AoA estimate from scanning
+
+rssiScanMax   = -inf(2,Nu);
+azScanMax     = nan(2,Nu);
+scanCount     = 0;
+
+userPosHatLog = nan(Nsteps,Nu,2);   % estimated user position [x y]
+userVelHatLog = nan(Nsteps,Nu,2);   % estimated velocity
+betaVel = 0.6;                      % smoothing factor
+
+% --- NEW: Time-correlated fading state per (BS,user) ---
+rhoComm = 0.98;
+alphaBU = (randn(2,Nu)+1j*randn(2,Nu))/sqrt(2);
+
+%% Main loop
+
+%% === Animation Setup ===
+figure(100); clf;
+set(gcf,'Color','w');
+
+axis equal;
+xlim([0 room.L]);
+ylim([0 room.W]);
+grid on;
+hold on;
+
+title("ISAC 2D Simulation Animation");
+
+% Draw room boundary
+rectangle('Position',[0 0 room.L room.W],'EdgeColor','k','LineWidth',2);
+
+% Create plot handles (for updating)
+hBS   = gobjects(2,1);
+hUser = gobjects(Nu,1);
+hObj  = gobjects(No,1);
+hBeam = gobjects(2,1);
+% === NEW: Velocity arrows + text labels ===
+hUserV = gobjects(Nu,1);
+hObjV  = gobjects(No,1);
+
+hUserTxt = gobjects(Nu,1);
+hObjTxt  = gobjects(No,1);
+
+for b=1:2
+    hBS(b) = plot(BS(b).pos(1),BS(b).pos(2),'ks','MarkerSize',10,'MarkerFaceColor','k');
+end
+
+for u=1:Nu
+    % user marker
+    hUser(u) = plot(users(u).pos(1), users(u).pos(2), 'bo', ...
+        'MarkerSize', 8, 'MarkerFaceColor', 'b');
+
+    % velocity arrow
+    hUserV(u) = quiver(users(u).pos(1), users(u).pos(2), users(u).vel(1), users(u).vel(2), ...
+        0, 'LineWidth', 1.5, 'MaxHeadSize', 2);
+
+    % text labelor b=1:2
+    hUserTxt(u) = text(users(u).pos(1)+0.3, users(u).pos(2)+0.3, "", 'FontSize', 9);
+end
+
+for o=1:No
+    % object marker
+    hObj(o) = plot(obj(o).pos(1), obj(o).pos(2), 'ro', ...
+        'MarkerSize', 8, 'MarkerFaceColor', 'r');
+
+    % velocity arrow
+    hObjV(o) = quiver(obj(o).pos(1), obj(o).pos(2), obj(o).vel(1), obj(o).vel(2), ...
+        0, 'LineWidth', 1.5, 'MaxHeadSize', 2);
+
+    % text label
+    hObjTxt(o) = text(obj(o).pos(1)+0.3, obj(o).pos(2)+0.3, "", 'FontSize', 9);
+end
+for b=1:2
+    hBeam(b) = plot([0 0],[0 0],'g-','LineWidth',2);
+end
+
+legend("Room","","BS1","BS2","Users","Objects","Beam");
+
+% Velocity arrows (direction & speed)
+hUserV = gobjects(Nu,1);
+hObjV  = gobjects(No,1);
+
+for u=1:Nu
+    hUserV(u) = quiver(users(u).pos(1), users(u).pos(2), users(u).vel(1), users(u).vel(2), ...
+        0, 'LineWidth', 1.5, 'MaxHeadSize', 2);
+end
+
+for o=1:No
+    hObjV(o) = quiver(obj(o).pos(1), obj(o).pos(2), obj(o).vel(1), obj(o).vel(2), ...
+        0, 'LineWidth', 1.5, 'MaxHeadSize', 2);
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+for t = 1:Nsteps
+    [users, obj] = stepMobility2D(users, obj, room, Tframe);
+% === NEW: update markers + arrows + text once per frame ===
+for u=1:Nu
+    set(hUser(u), 'XData', users(u).pos(1), 'YData', users(u).pos(2));
+
+    set(hUserV(u), 'XData', users(u).pos(1), 'YData', users(u).pos(2), ...
+        'UData', users(u).vel(1), 'VData', users(u).vel(2));
+
+    spd = norm(users(u).vel);
+    hdg = atan2d(users(u).vel(2), users(u).vel(1));
+    set(hUserTxt(u), 'Position', [users(u).pos(1)+0.3, users(u).pos(2)+0.3, 0], ...
+        'String', sprintf("U%d: %.2f m/s, %.0f°", u, spd, hdg));
+end
+
+for o=1:No
+    set(hObj(o), 'XData', obj(o).pos(1), 'YData', obj(o).pos(2));
+
+    set(hObjV(o), 'XData', obj(o).pos(1), 'YData', obj(o).pos(2), ...
+        'UData', obj(o).vel(1), 'VData', obj(o).vel(2));
+
+    spd = norm(obj(o).vel);
+    hdg = atan2d(obj(o).vel(2), obj(o).vel(1));
+    set(hObjTxt(o), 'Position', [obj(o).pos(1)+0.3, obj(o).pos(2)+0.3, 0], ...
+        'String', sprintf("O%d: %.2f m/s, %.0f°", o, spd, hdg));
+end
+   for b = 1:2
+    % update fading (Wiener/AR(1) complex)
+    alphaBU(b,:) = rhoComm*alphaBU(b,:) + sqrt(1-rhoComm^2) * (randn(1,Nu)+1j*randn(1,Nu))/sqrt(2);
+    % 1) Beam azimuth + wall range
+        beamAz = azGrid(mod(t-1, Nbeams)+1);   % 360° sweep
+        %[beamAz, bestU] = selectBeamToUsers(BS(b).pos, users, azGrid, beamwidthDeg, Gmain_dB, Gside_dB);
+        [wallRange, ~] = rangeToRoomWalls(BS(b).pos, beamAz, room);
+
+        % 2) Update users/objects (μία φορά είναι αρκετή, αλλά οκ)
+        for u=1:Nu
+
+    az_u = azimuthDeg2D(BS(b).pos, users(u).pos);
+
+    d = wrapTo180(az_u - beamAz);
+
+    if abs(d) <= beamwidthDeg/2
+        set(hUser(u),'MarkerFaceColor','g'); % inside beam
+    else
+        set(hUser(u),'MarkerFaceColor','b'); % outside beam
+    end
+
+end
+        for o=1:No
+            set(hObj(o),'XData',obj(o).pos(1),'YData',obj(o).pos(2));
+        end
+
+        % 3) Update beam line for BS(b)
+        x0 = BS(b).pos(1); y0 = BS(b).pos(2);
+        th = deg2rad(beamAz);
+        xBeam = [x0, x0 + wallRange*cos(th)];
+        yBeam = [y0, y0 + wallRange*sin(th)];
+        set(hBeam(b),'XData',xBeam,'YData',yBeam);
+
+        drawnow limitrate
+        pause(0.02);
+
+    % 3) TX OFDM frame
+    tx = makeOFDMFrameSISO(Nfft, cpLen, NsSym, fftBins, M);
+
+    % 4) COMM
+    for u = 1:Nu
+
+    az_u = azimuthDeg2D(BS(b).pos, users(u).pos);
+
+    % gain depending on beam direction
+    G_dB = sectorBeamGain(beamAz, az_u, beamwidthDeg, Gmain_dB, Gside_dB);
+    G = 10^(G_dB/20);
+
+    % channel
+    h = buildSISOChannelIR(BS(b).pos, users(u).pos, obj, fc, Fs);
+
+    % transmit signal
+    y = filter(h, 1, tx.time) * G;
+    y = y * alphaBU(b,u);
+
+    % noise
+    y = awgn(y, SNRdB, "measured");
+
+    symLen = Nfft + cpLen;
+    need = symLen * NsSym;
+
+    if numel(y) < need
+        yPad = [y; zeros(need - numel(y), 1)];
+    else
+        yPad = y(1:need);
+    end
+
+    bitsRx = rxOFDMFrameSISO(yPad, Nfft, cpLen, NsSym, fftBins, M);
+
+    L = min(numel(bitsRx), numel(tx.bits));
+
+    berLog(t,b,u) = mean(bitsRx(1:L) ~= tx.bits(1:L));
+
+    % scanning-based AoA: use received power proxy (measured)
+P = mean(abs(y).^2);  % received power after channel/noise (proxy)
+
+if P > rssiScanMax(b,u)
+    rssiScanMax(b,u) = P;
+    azScanMax(b,u)   = beamAz;
+end
+    for u=1:Nu
+    th1 = aoaHatUserLog(t,1,u);
+    th2 = aoaHatUserLog(t,2,u);
+
+    if ~isnan(th1) && ~isnan(th2)
+        pHat = intersectRays2D(BS(1).pos, th1, BS(2).pos, th2);
+
+        if all(isfinite(pHat))
+            userPosHatLog(t,u,:) = pHat(:);
+
+            if t>1 && all(isfinite(squeeze(userPosHatLog(t-1,u,:))))
+                vHat = (squeeze(userPosHatLog(t,u,:)) - squeeze(userPosHatLog(t-1,u,:))) / Tframe;
+
+                if t==2 || any(isnan(userVelHatLog(t-1,u,:)))
+                    userVelHatLog(t,u,:) = vHat;
+                else
+                    userVelHatLog(t,u,:) = betaVel*squeeze(userVelHatLog(t-1,u,:)) + (1-betaVel)*vHat;
+                end
+            end
+        end
+    end
+end
+
+end
+
+    % 5) SENSING
+    [rngEst, z] = senseRangeAndSlowSample(tx.time, BS(b).pos, obj, fc, Fs, Tframe);
+slowZ(t,b,:) = z;
+if t >= 2
+    for i=1:No
+        z1 = slowZ(t,b,i);
+        z0 = slowZ(t-1,b,i);
+        if isfinite(z1) && isfinite(z0) && abs(z1)>0 && abs(z0)>0
+            dphi = angle(z1 * conj(z0));     % phase change between frames
+            fdHatLog(t,b,i) = dphi/(2*pi*Tframe);  % Hz
+        end
+    end
+end
+
+    % 6) TRUTH
+    [rangeObj, aoaObjDeg, ~, fdMonoObj] = truthRangeAoADoppler(BS(b).pos, obj, lambda);
+
+   
+    % 7) Logs
+    rangeObjLog(t,b,:)  = rangeObj;
+    aoaObjLog(t,b,:)    = aoaObjDeg;
+    fdMonoLog(t,b,:)    = fdMonoObj;
+    wallRangeLog(t,b)   = wallRange;
+    rangeEstLog(t,b,:)  = reshape(rngEst, 1, 1, []);
+    azScanMax     = nan(2,Nu);
+    scanCount     = 0;
+    userPosHatLog = nan(Nsteps,Nu,2); % (t,u,[x y])
+    userVelHatLog = nan(Nsteps,Nu,2);
+    betaVel = 0.6; % smoothing
+    end
+
+scanCount = scanCount + 1;
+
+% When a full 360 sweep completes, freeze AoA estimates for this sweep
+if scanCount == Nbeams
+    for b=1:2
+        for u=1:Nu
+            aoaHatUserLog(t,b,u) = azScanMax(b,u);
+        end
+    end
+    % reset for next sweep
+    rssiScanMax(:) = -inf;
+    azScanMax(:)   = nan;
+    scanCount = 0;
+else
+    % carry previous estimate forward (so you have value each frame)
+    if t>1
+        aoaHatUserLog(t,:,:) = aoaHatUserLog(t-1,:,:);
+    end
+end
+end
+b = 1; i = 1;
+
+figure; plot(squeeze(rangeObjLog(:,b,i))); grid on;
+title("Truth Range (Object1 to BS1)"); xlabel("Frame"); ylabel("m");
+
+figure; plot(squeeze(aoaObjLog(:,b,i))); grid on;
+title("Truth AoA (Object1 to BS1)"); xlabel("Frame"); ylabel("deg");
+
+figure; plot(squeeze(fdMonoLog(:,b,i))); grid on;
+title("Truth Monostatic Doppler (Object1 to BS1)"); xlabel("Frame"); ylabel("Hz");
+
+figure; plot(wallRangeLog(:,b)); grid on;
+title("Wall range along beam (BS1)"); xlabel("Frame"); ylabel("m");
+
+
+%% Results
+fprintf("Avg BER per user:\n");
+avgBER = squeeze(mean(berLog,1));   % avgBER is 2xNu : (BS x User)
+
+BERtable = array2table(avgBER.', ...
+    'VariableNames', {'BS1','BS2'}, ...
+    'RowNames', arrayfun(@(u) sprintf('User%d',u), 1:Nu, 'UniformOutput', false));
+
+disp(BERtable)
+
+figure;
+plot(movmean(squeeze(berLog(:,1,1)),10));
+grid on;
+xlabel("Frame"); ylabel("BER");
+title("BER - BS1 to User1");
+
+figure;
+plot(movmean(squeeze(berLog(:,1,2)),10));
+grid on;
+xlabel("Frame"); ylabel("BER");
+title("BER - BS1 to User2");
+
+
+b = 1; % BS1
+figure;
+plot(squeeze(fdHatLog(:,b,:)), 'LineWidth', 1.2);
+grid on;
+xlabel("Frame"); ylabel("Estimated Doppler (Hz)");
+title("Estimated Doppler from signal (BS1)");
+legend(arrayfun(@(i) sprintf("Obj%d",i), 1:No, 'UniformOutput', false), 'Location','best');
+
+figure;
+plot(squeeze(fdMonoLog(:,b,:)), '--', 'LineWidth', 1.2);
+grid on;
+xlabel("Frame"); ylabel("Truth Doppler (Hz)");
+title("Truth Doppler from geometry (BS1)");
+legend(arrayfun(@(i) sprintf("Obj%d",i), 1:No, 'UniformOutput', false), 'Location','best');
+
+figure;
+plot(squeeze(fdHatLog(:,b,1)), 'LineWidth', 1.5); hold on;
+plot(squeeze(fdMonoLog(:,b,1)), '--', 'LineWidth', 1.5);
+grid on;
+xlabel("Frame"); ylabel("Doppler (Hz)");
+title("Doppler comparison (BS1, Obj1)");
+legend("Estimated","Truth","Location","best");
+%% Sensing results (per BS)
+
+figure;
+plot(squeeze(rangeEstLog(:,1,:)));
+grid on;
+xlabel("Frame"); ylabel("Estimated range (m)");
+title("Sensing: estimated ranges to objects (BS1)");
+legend("Obj1","Obj2","Obj3");
+
+figure;
+plot(squeeze(rangeEstLog(:,2,:)));
+grid on;
+xlabel("Frame"); ylabel("Estimated range (m)");
+title("Sensing: estimated ranges to objects (BS2)");
+legend("Obj1","Obj2","Obj3");
+
+%% ---------------- Local functions ----------------
+function [users,obj] = stepMobility2D(users,obj,room,dt)
+    for i=1:numel(users)
+        users(i).pos = users(i).pos + users(i).vel*dt;
+        [users(i).pos, users(i).vel] = bounce2D(users(i).pos, users(i).vel, room);
+    end
+    for i=1:numel(obj)
+        obj(i).pos = obj(i).pos + obj(i).vel*dt;
+        [obj(i).pos, obj(i).vel] = bounce2D(obj(i).pos, obj(i).vel, room);
+    end
+end
+
+function [p,v] = bounce2D(p,v,room)
+    if p(1) < 0,      p(1)=0;      v(1)=-v(1); end
+    if p(1) > room.L, p(1)=room.L; v(1)=-v(1); end
+    if p(2) < 0,      p(2)=0;      v(2)=-v(2); end
+    if p(2) > room.W, p(2)=room.W; v(2)=-v(2); end
+end
+
+function tx = makeOFDMFrameSISO(Nfft,cpLen,Nsym,fftBins,M)
+    bitsPerSym = log2(M);
+    Nsc = numel(fftBins);
+
+    tx.bits = randi([0 1], Nsc*Nsym*bitsPerSym, 1);
+
+    symIdx = bi2de(reshape(tx.bits,bitsPerSym,[]).', 'left-msb');
+    sym    = qammod(symIdx, M, 'UnitAveragePower', true);
+    grid   = reshape(sym, Nsc, Nsym);
+
+    X = zeros(Nfft, Nsym);
+    X(fftBins,:) = grid;
+
+    x = ifft(ifftshift(X,1), Nfft, 1);
+    xcp = [x(end-cpLen+1:end,:); x];
+    tx.time = xcp(:);
+end
+
+function bits = rxOFDMFrameSISO(y,Nfft,cpLen,Nsym,fftBins,M)
+    % reshape to OFDM symbols (assume perfect timing for now)
+    symLen = Nfft + cpLen;
+    y = y(1:symLen*Nsym);               % truncate
+    Y = reshape(y, symLen, Nsym);
+    Y = Y(cpLen+1:end,:);               % remove CP
+
+    % FFT + extract active subcarriers
+    Xhat = fftshift(fft(Y,Nfft,1),1);
+    gridHat = Xhat(fftBins,:);
+    % --- VERY simple equalization using known channel h (needs passing h) ---
+% gridHat = gridHat ./ H(fftBins)
+
+    idxHat = qamdemod(gridHat(:), M, 'UnitAveragePower', true);
+    bitsPerSym = log2(M);
+    bits = de2bi(idxHat, bitsPerSym, 'left-msb').';
+    bits = bits(:);
+end
+
+function h = buildSISOChannelIR(txPos, rxPos, obj, fc, Fs)
+    c=3e8;
+
+    % LoS path
+    d0 = norm(rxPos - txPos);
+    tau0 = d0/c;
+    a0 = friisAmp(d0,fc) * exp(1j*2*pi*rand);
+
+    % Quantize delays to samples (simple)
+    n0 = round(tau0*Fs);
+
+    % include few reflected paths via objects (tx->obj->rx)
+    K = min(3, numel(obj));
+    taps = [n0];
+    gains = [a0];
+
+    for i=1:K
+        d1 = norm(obj(i).pos - txPos);
+        d2 = norm(rxPos - obj(i).pos);
+        d = d1 + d2;
+        tau = d/c;
+        n = round(tau*Fs);
+        a = 0.25*friisAmp(d,fc) * exp(1j*2*pi*rand);
+        taps(end+1) = n; 
+        gains(end+1)= a; 
+    end
+
+    % Build FIR
+    L = max(taps) + 1;
+    h = zeros(L,1);
+    for k=1:numel(taps)
+        h(taps(k)+1) = h(taps(k)+1) + gains(k);
+    end
+end
+
+function amp = friisAmp(d,fc)
+    c=3e8;
+    amp = (c/(4*pi*fc*max(d,1e-6)));
+end
+
+function az = azimuthDeg2D(p1,p2)
+    v = p2 - p1;
+    az = atan2d(v(2), v(1));
+end
+
+function GdB = sectorBeamGain(beamAz, targetAz, bwDeg, Gmain_dB, Gside_dB)
+    d = wrapTo180(targetAz - beamAz);
+    if abs(d) <= bwDeg/2
+        GdB = Gmain_dB;
+    else
+        GdB = Gside_dB;
+    end
+end
+
+function rngEst = senseRangesByCorrelation(txTime, bsPos, obj, fc, Fs)
+    c=3e8;
+    x = txTime(:);
+    rngEst = nan(1, numel(obj));
+
+    for i=1:numel(obj)
+        d = norm(obj(i).pos - bsPos);
+        tau = 2*d/c;
+        n0 = round(tau*Fs);
+        if n0 >= numel(x), continue; end
+
+        echo = [zeros(n0,1); x(1:end-n0)] * (0.1*obj(i).rcs);
+        r = xcorr(echo, x);
+        [~,ix] = max(abs(r));
+        lag = ix - numel(x);
+        tauHat = abs(lag)/Fs;
+        rngEst(i) = (tauHat*c)/2;
+    end
+end
+
+function p = intersectRays2D(p1, th1deg, p2, th2deg)
+% Intersect two rays:
+% ray1: p1 + t1*[cos th1; sin th1]
+% ray2: p2 + t2*[cos th2; sin th2]
+
+    th1 = deg2rad(th1deg);
+    th2 = deg2rad(th2deg);
+
+    d1 = [cos(th1); sin(th1)];
+    d2 = [cos(th2); sin(th2)];
+
+    A = [d1, -d2];     % 2x2
+    b = (p2 - p1);     % 2x1
+
+    if abs(det(A)) < 1e-6
+        p = [NaN; NaN]; % nearly parallel
+        return;
+    end
+
+    t = A\b;
+    t1 = t(1);
+
+    p = p1 + t1*d1;
+end
+
+function [rngEst, z] = senseRangeAndSlowSample(txTime, bsPos, obj, fc, Fs, Tframe)
+% Range via correlation + coherent slow-time sample z (complex) at peak.
+% Adds Doppler in the echo: exp(j*2*pi*fD*t)
+
+    c = 3e8;
+    lambda = c/fc;
+    x = txTime(:);
+    N = numel(x);
+
+    rngEst = nan(1, numel(obj));
+    z      = nan(1, numel(obj));
+
+    n = (0:N-1).';          % sample index
+    t = n/Fs;               % fast-time inside one frame
+
+    for i=1:numel(obj)
+        % Monostatic range (BS->obj->BS)
+        d = norm(obj(i).pos - bsPos);
+        tau = 2*d/c;
+        n0 = round(tau*Fs);
+        if n0 >= N
+            continue;
+        end
+
+        % Monostatic Doppler from radial velocity (truth enters the SIGNAL)
+        u = (obj(i).pos - bsPos) / max(d,1e-9);  % unit LOS
+        vRad = dot(obj(i).vel, u);               % radial speed (m/s)
+        fD = 2*vRad/lambda;                      % monostatic Doppler (Hz)
+
+        % Apply delay + Doppler on the echo
+        echo = zeros(N,1);
+        echo(n0+1:end) = x(1:end-n0) .* exp(1j*2*pi*fD*t(1:end-n0));
+        phi = 0;
+if isfield(obj(i),'phi'), phi = obj(i).phi; end
+echo = echo * (0.1*obj(i).rcs) * exp(1j*phi);
+
+        % Matched filter / correlation
+        r = xcorr(echo, x);
+        [~,ix] = max(abs(r));
+        lag = ix - N;
+        tauHat = abs(lag)/Fs;
+        rngEst(i) = (tauHat*c)/2;
+
+        % Coherent slow-time sample: complex value at the peak
+        z(i) = r(ix);
+    end
+end

@@ -1,0 +1,645 @@
+%% ISAC SISO 2D Simulation 
+clear; clc; close all;
+
+%% Constants
+c  = 3e8;
+fc = 28e9;
+lambda = c/fc;
+
+%% Room 2D
+room.L = 40;
+room.W = 20;
+
+%% Base stations (2D)
+BS(1).pos = [0; room.W/2];          
+BS(2).pos = [room.L; room.W/2];      
+BS(3).pos = [room.L/2; 0];           
+BS(4).pos = [room.L/2; room.W];   
+%% OFDM parameters
+
+deltaF = 120e3;      % 120 kHz subcarrier spacing
+Nfft   = 4096;       % Fs = 491.52 MHz
+Fs     = deltaF*Nfft;
+
+cpLen  = 288;        % ~7% CP
+Nsc    = 3072;       % active subcarriers (fits inside Nfft)
+M      = 16;
+Nt = 4;        % κεραίες εκπομπής ανά BS
+dAnt = 0.5;    % απόσταση κεραιών (σε λήψεις του λ)
+NsSym  = 64;          % μειωμένο για να τρέχει (μπορείς να το ανεβάσεις μετά)
+
+scIdx   = (-Nsc/2:Nsc/2-1).';
+fftBins = mod(scIdx + Nfft/2, Nfft) + 1;
+ 
+%Fs = deltaF * Nfft;    % sampling rate (consistent)
+
+%% Time
+Tframe = 1e-3;
+Nsteps = 200;
+
+%% Users (moving)
+Nu = 2;
+for u=1:Nu
+    users(u).pos = [room.L*(0.2+0.6*rand); room.W*rand];
+    users(u).vel = 1.0 * randn(2,1);
+end
+%% Eavesdroppers (moving malicious users)
+Ne = 2;
+for e = 1:Ne
+    eve(e).pos = [room.L*(0.2+0.6*rand); room.W*rand];
+    eve(e).vel = 0.8 * randn(2,1);
+end
+%% Objects (moving reflectors)
+No = 3;
+for o=1:No
+    obj(o).pos = [room.L*rand; room.W*rand];
+    obj(o).vel = 0.5 * randn(2,1);
+    obj(o).rcs = 1;
+    obj(o).phi = 2*pi*rand;   % τυχαία φάση ανάκλασης
+end
+
+%% 360° beam pattern (NOT MIMO beamforming, just sector gain)
+%%Nbeams = 36;
+Nbeams = 52;
+azGrid = linspace(-180,180,Nbeams+1); azGrid(end)=[];
+beamwidthDeg = 7;
+Gmain_dB = 18;
+Gside_dB = -5;
+
+%% SNR
+SNRdB = 15;
+
+%% Logs
+
+berLog        = zeros(Nsteps,4,Nu);
+rangeEstLog   = nan(Nsteps,4,No);
+rangeObjLog   = zeros(Nsteps,4,No);
+crbAoALog = nan(Nsteps,4,No);  % CRB γωνίας
+aoaObjLog     = zeros(Nsteps,4,No);
+fdMonoLog     = zeros(Nsteps,4,No);
+wallRangeLog  = zeros(Nsteps,4);
+slowZ = nan(Nsteps,4,No);   % complex slow-time sample per (t, BS, obj)
+fdHatLog = nan(Nsteps,4,No); % Doppler estimate (Hz)
+rdRangeLog   = nan(Nsteps,4,No); % range από 2D FFT
+rdDopplerLog = nan(Nsteps,4,No); % doppler από 2D FFT
+
+txBSLog  = nan(Nsteps, Nu);   % ποιος BS στέλνει σε κάθε user
+jamBSLog = nan(Nsteps, Nu, 4); % ποιοι BS κάνουν jamming
+
+alphaBU       = (randn(4,Nu)+1j*randn(4,Nu))/sqrt(2);
+
+% --- NEW logs for scanning AoA + localization ---
+aoaHatUserLog = nan(Nsteps,4,Nu);   % AoA estimate from scanning
+
+rssiScanMax   = -inf(4,Nu);
+azScanMax     = nan(4,Nu);
+scanCount     = 0;
+
+userPosHatLog = nan(Nsteps,Nu,2);   % estimated user position [x y]
+userVelHatLog = nan(Nsteps,Nu,2);   % estimated velocity
+betaVel = 0.6;                      % smoothing factor
+
+% --- NEW: Time-correlated fading state per (BS,user) ---
+rhoComm = 0.98;
+%alphaBU = (randn(2,Nu)+1j*randn(2,Nu))/sqrt(2);
+%%%%%%%%%%%%%%%%
+% figure(200); clf;
+% hScatter = scatter(real(zeros(100,1)), imag(zeros(100,1)), '.');
+% grid on;
+% axis equal;
+% xlim([-2 2]);
+% ylim([-2 2]);
+% title("Constellation (Equalized)");
+% xlabel("In-Phase");
+% ylabel("Quadrature");
+ eveAoALog        = nan(Nsteps,4,Ne);
+ eveRangeLog      = nan(Nsteps,4,Ne);
+ eveFdTruthLog    = nan(Nsteps,4,Ne);
+ 
+ eveBerLog        = nan(Nsteps,Nu,Ne);     % BER of each Eve trying to intercept each legit user
+ secrecyRateLog   = nan(Nsteps,Nu);        % secrecy capacity per legit user
+ chosenBSLog      = nan(Nsteps,Nu);        % which BS serves each legit user
+
+
+
+
+
+
+%% Main loop
+%% Main loop
+
+for t = 1:Nsteps
+
+ [users, obj, eve] = stepMobilityAll(users, obj, eve, room, Tframe);
+
+    % === BEAM + COMM + PLS (για κάθε BS) ===
+    SNRlin = 10^(SNRdB/10);
+    beamAz = azGrid(mod(t-1, Nbeams)+1);   % ίδια δέσμη και για τους 2 BS
+
+    for b = 1:4
+
+        % Fading update
+        alphaBU(b,:) = rhoComm*alphaBU(b,:) + ...
+            sqrt(1-rhoComm^2) * (randn(1,Nu)+1j*randn(1,Nu))/sqrt(2);
+
+        % Beam + wall range
+        [wallRange, ~] = rangeToRoomWalls(BS(b).pos, beamAz, room);
+
+
+
+
+        % TX OFDM frame
+        tx = makeOFDMFrameSISO(Nfft, cpLen, NsSym, fftBins, M);
+
+        % COMM + BER + RSSI scanning
+        for u = 1:Nu
+            az_u = azimuthDeg2D(BS(b).pos, users(u).pos);
+            G_dB = sectorBeamGain(beamAz, az_u, beamwidthDeg, Gmain_dB, Gside_dB);
+            G    = 10^(G_dB/20);
+            h_mimo = buildMIMOChannelIR(BS(b).pos, users(u).pos, obj, fc, Fs, Nt, dAnt);
+         % Beamforming weight vector: matched filter = h*/||h||
+        w = conj(h_mimo) / norm(h_mimo);
+    % Effective scalar channel μετά beamforming: w^H * h
+    h_eff = w' * h_mimo;   % scalar (complex)
+    % Εφαρμογή στο σήμα
+    y = tx.time * h_eff * alphaBU(b,u);
+    y = awgn(y, SNRdB, "measured");
+
+            symLen = Nfft + cpLen;
+            need   = symLen * NsSym;
+             if numel(y) < need
+                 yPad = [y; zeros(need - numel(y), 1)];
+             else
+                 yPad = y(1:need);
+             end
+
+            [bitsRx, symOut] = rxOFDMFrameSISO(yPad, tx.grid, Nfft, cpLen, NsSym, fftBins, M);
+            L = min(numel(bitsRx), numel(tx.bits));
+            berLog(t,b,u) = mean(bitsRx(1:L) ~= tx.bits(1:L));
+
+            % RSSI scanning για AoA εκτίμηση
+            P = mean(abs(y).^2);
+            if P > rssiScanMax(b,u)
+                rssiScanMax(b,u) = P;
+                azScanMax(b,u)   = beamAz;
+            end
+        end
+
+        % CRB υπολογισμός
+        for i = 1:No
+            d_i = rangeObjLog(t,b,i);
+            if d_i > 0
+                SNRecho = SNRlin * (lambda/(4*pi*d_i))^2 * obj(i).rcs;
+                SNRecho = max(SNRecho, 1e-10);
+                BW = Nsc * deltaF;
+                crbAoALog(t,b,i) = (c^2) / (8*pi^2 * SNRecho * NsSym * BW^2 * d_i^2);
+            end
+        end
+
+        % PLS: επιλογή BS
+        for u = 1:Nu
+  
+    %         %  [bestBS, bestSR] = chooseSecureBS(users(u).pos, eve, BS, beamAz, ...
+    %         % beamwidthDeg, Gmain_dB, Gside_dB, SNRlin);
+            [bestBS, bestSR] = chooseSecureBS(users(u).pos, eve, BS, Nt, dAnt, lambda, SNRlin);
+     
+           chosenBSLog(t,u)    = bestBS;
+             secrecyRateLog(t,u) = bestSR;
+         end
+     
+    % for u = 1:Nu
+    %     [bestBS, bestSR] = chooseSecureBS(users(u).pos, eve, BS, ...
+    %         beamwidthDeg, Gmain_dB, Gside_dB, SNRlin);
+    %     chosenBSLog(t,u)    = bestBS;
+    %     secrecyRateLog(t,u) = bestSR;
+    %     txBSLog(t,u)        = bestBS;
+    %     jammers = setdiff(1:4, bestBS);
+    %     jamBSLog(t,u,jammers) = 1;
+    % end
+
+    % === LOCALIZATION ...
+
+
+    end  % end for b (comm)
+
+    % === LOCALIZATION — εκτός for b, χρησιμοποιεί AoA και από τους 2 BS ===
+    for u = 1:Nu
+        th1 = aoaHatUserLog(t,1,u);
+        th2 = aoaHatUserLog(t,2,u);
+        if ~isnan(th1) && ~isnan(th2)
+            pHat = intersectRays2D(BS(1).pos, th1, BS(2).pos, th2);
+            if all(isfinite(pHat)) && pHat(1)>=0 && pHat(1)<=room.L && ...
+                                       pHat(2)>=0 && pHat(2)<=room.W
+                userPosHatLog(t,u,:) = pHat(:);
+            end
+        end
+    end
+
+    % === SENSING + TRUTH + LOGS (για κάθε BS) ===
+    for b = 1:4
+
+        % Sensing
+       [rngEst, z, rxGrid_radar] = senseRangeAndSlowSample(tx.time, tx.grid, BS(b).pos, obj, fc, Fs, Tframe, Nfft, cpLen, NsSym, fftBins);
+        slowZ(t,b,:) = z;
+        if t >= 2
+            for i = 1:No
+                z1 = slowZ(t,b,i);   z0 = slowZ(t-1,b,i);
+                if isfinite(z1) && isfinite(z0) && abs(z1)>0 && abs(z0)>0
+                    dphi = angle(z1 * conj(z0));
+                    fdHatLog(t,b,i) = dphi / (2*pi*Tframe);
+                end
+            end
+        end
+
+         % 2D FFT Range-Doppler
+        [rdMap, range_ax, dop_ax] = senseRangeDoppler2D(...
+        tx.grid, rxGrid_radar, Nfft, Nsc, fftBins, deltaF, NsSym, Tframe, cpLen, Fs);
+
+        [~, peak_idx] = max(rdMap(:));
+        [peak_row, peak_col] = ind2sub(size(rdMap), peak_idx);
+        for i = 1:No
+            rdRangeLog(t,b,i)   = range_ax(peak_row);
+            rdDopplerLog(t,b,i) = dop_ax(peak_col);
+        end
+
+        % Truth
+        [rangeObj, aoaObjDeg, ~, fdMonoObj] = truthRangeAoADoppler(BS(b).pos, obj, lambda);
+        [eveRange, eveAoA,    ~, eveFd]     = truthRangeAoADoppler(BS(b).pos, eve, lambda);
+
+        % Logs
+        rangeObjLog(t,b,:)   = rangeObj;
+        aoaObjLog(t,b,:)     = aoaObjDeg;
+        fdMonoLog(t,b,:)     = fdMonoObj;
+        wallRangeLog(t,b)    = wallRange;
+        rangeEstLog(t,b,:)   = reshape(rngEst, 1, 1, []);
+        eveRangeLog(t,b,:)   = eveRange;
+        eveAoALog(t,b,:)     = eveAoA;
+        eveFdTruthLog(t,b,:) = eveFd;
+
+    end  % end for b (sensing)
+
+    % % === Constellation display ===
+    % set(hScatter, ...
+    %     'XData', real(symOut(1:200:end)), ...
+    %     'YData', imag(symOut(1:200:end)));
+
+    % === AoA scan update — ΜΙΑ ΦΟΡΑ ανά frame ===
+    
+    % fprintf('t=%d scanCount=%d azScanMax(1,1)=%.1f\n', t, scanCount, azScanMax(1,1));
+    % 
+     % DEBUG
+     if mod(t, 52) == 0
+         fprintf('t=%d, scanCount=%d, aoaHat(t,1,1)=%.1f, aoaHat(t,2,1)=%.1f\n', ...
+             t, scanCount, aoaHatUserLog(t,1,1), aoaHatUserLog(t,2,1));
+    end
+
+
+
+    scanCount = scanCount + 1;
+
+      if scanCount == Nbeams
+        for b = 1:4
+            for u = 1:Nu
+                aoaHatUserLog(t,b,u) = azScanMax(b,u);
+            end
+        end
+        rssiScanMax(:) = -inf;
+        azScanMax(:)   = nan;
+        scanCount      = 0;
+    else
+        if t > 1
+            aoaHatUserLog(t,:,:) = aoaHatUserLog(t-1,:,:);
+        end
+    end
+
+    % === LOCALIZATION — μετά το AoA update ===
+    for u = 1:Nu
+        th1 = aoaHatUserLog(t,1,u);
+        th2 = aoaHatUserLog(t,2,u);
+        if ~isnan(th1) && ~isnan(th2)
+            pHat = intersectRays2D(BS(1).pos, th1, BS(2).pos, th2);
+            if all(isfinite(pHat))
+                userPosHatLog(t,u,:) = pHat(:);
+            end
+        end
+    end
+
+    
+
+  
+save('isac_results.mat', 'berLog', 'secrecyRateLog', 'chosenBSLog', ...
+     'rangeEstLog', 'rangeObjLog', 'fdHatLog', 'fdMonoLog', ...
+     'aoaObjLog', 'wallRangeLog', 'crbAoALog', 'userPosHatLog', ...
+     'eveRangeLog', 'eveAoALog', 'eveFdTruthLog');
+end  % end for t
+
+
+b = 1; i = 1;
+
+
+
+%% Results
+fprintf("Avg BER per user:\n");
+avgBER = squeeze(mean(berLog,1));   % avgBER is 2xNu : (BS x User)
+
+BERtable = array2table(avgBER.', ...
+    'VariableNames', {'BS1','BS2','BS3','BS4'}, ...
+    'RowNames', arrayfun(@(u) sprintf('User%d',u), 1:Nu, 'UniformOutput', false));
+
+disp(BERtable)
+
+figure;
+plot(movmean(squeeze(berLog(:,1,1)),10));
+grid on;
+xlabel("Frame"); ylabel("BER");
+title("BER - BS1 to User1");
+
+figure;
+plot(movmean(squeeze(berLog(:,1,2)),10));
+grid on;
+xlabel("Frame"); ylabel("BER");
+title("BER - BS1 to User2");
+
+figure; 
+plot(movmean(squeeze(berLog(:,3,1)),10));
+grid on;
+xlabel("Frame"); ylabel("BER");
+title("BER - BS3 to User1");
+
+figure; 
+plot(movmean(squeeze(berLog(:,4,1)),10));
+grid on;
+xlabel("Frame"); ylabel("BER");
+title("BER - BS4 to User2");
+
+
+b = 1; % BS1
+figure;
+plot(squeeze(fdHatLog(:,b,:)), 'LineWidth', 1.2);
+grid on;
+xlabel("Frame"); ylabel("Estimated Doppler (Hz)");
+title("Estimated Doppler from signal (BS1)");
+legend(arrayfun(@(i) sprintf("Obj%d",i), 1:No, 'UniformOutput', false), 'Location','best');
+
+figure;
+plot(squeeze(fdMonoLog(:,b,:)), '--', 'LineWidth', 1.2);
+grid on;
+xlabel("Frame"); ylabel("Truth Doppler (Hz)");
+title("Truth Doppler from geometry (BS1)");
+legend(arrayfun(@(i) sprintf("Obj%d",i), 1:No, 'UniformOutput', false), 'Location','best');
+
+figure;
+plot(squeeze(fdHatLog(:,b,1)), 'LineWidth', 1.5); hold on;
+plot(squeeze(fdMonoLog(:,b,1)), '--', 'LineWidth', 1.5);
+grid on;
+xlabel("Frame"); ylabel("Doppler (Hz)");
+title("Doppler comparison (BS1, Obj1)");
+legend("Estimated","Truth","Location","best");
+
+
+%% Secrecy Rate summary
+fprintf("\nAvg Secrecy Rate per user:\n");
+avgSR = mean(secrecyRateLog, 1, 'omitnan');   % [1 x Nu]
+
+SRtable = array2table(avgSR.', ...
+    'VariableNames', {'Avg_SR'}, ...
+    'RowNames', arrayfun(@(u) sprintf('User%d',u), 1:Nu, 'UniformOutput', false));
+
+disp(SRtable)
+
+fprintf("Max Secrecy Rate per user:\n");
+maxSR = max(secrecyRateLog, [], 1);
+
+maxSRtable = array2table(maxSR.', ...
+    'VariableNames', {'Max_SR'}, ...
+    'RowNames', arrayfun(@(u) sprintf('User%d',u), 1:Nu, 'UniformOutput', false));
+
+disp(maxSRtable)
+
+fprintf("Min Secrecy Rate per user:\n");
+minSR = min(secrecyRateLog, [], 1);
+
+minSRtable = array2table(minSR.', ...
+    'VariableNames', {'Min_SR'}, ...
+    'RowNames', arrayfun(@(u) sprintf('User%d',u), 1:Nu, 'UniformOutput', false));
+
+disp(minSRtable)
+
+
+%% ---------------- Local functions ----------------
+function [users,obj,eve] = stepMobilityAll(users,obj,eve,room,dt)
+    for i=1:numel(users)
+        users(i).pos = users(i).pos + users(i).vel*dt;
+        [users(i).pos, users(i).vel] = bounce2D(users(i).pos, users(i).vel, room);
+    end
+    for i=1:numel(obj)
+        obj(i).pos = obj(i).pos + obj(i).vel*dt;
+        [obj(i).pos, obj(i).vel] = bounce2D(obj(i).pos, obj(i).vel, room);
+    end
+    for i=1:numel(eve)
+        eve(i).pos = eve(i).pos + eve(i).vel*dt;
+        [eve(i).pos, eve(i).vel] = bounce2D(eve(i).pos, eve(i).vel, room);
+    end
+end
+
+function [p,v] = bounce2D(p,v,room)
+    if p(1) < 0,      p(1)=0;      v(1)=-v(1); end
+    if p(1) > room.L, p(1)=room.L; v(1)=-v(1); end
+    if p(2) < 0,      p(2)=0;      v(2)=-v(2); end
+    if p(2) > room.W, p(2)=room.W; v(2)=-v(2); end
+end
+
+function tx = makeOFDMFrameSISO(Nfft,cpLen,Nsym,fftBins,M)
+    bitsPerSym = log2(M);
+    Nsc = numel(fftBins);
+    tx.bits = randi([0 1], Nsc*Nsym*bitsPerSym, 1);
+    symIdx = bi2de(reshape(tx.bits,bitsPerSym,[]).', 'left-msb');
+    sym    = qammod(symIdx, M, 'UnitAveragePower', true);
+    grid   = reshape(sym, Nsc, Nsym);
+    tx.grid = grid;
+    X = zeros(Nfft, Nsym);
+    X(fftBins,:) = grid;
+    x = ifft(ifftshift(X,1), Nfft, 1);
+    xcp = [x(end-cpLen+1:end,:); x];
+    tx.time = xcp(:);
+end
+
+function [bits, symOut] = rxOFDMFrameSISO(y,txGrid,Nfft,cpLen,Nsym,fftBins,M)
+    symLen = Nfft + cpLen;
+    y = y(1:symLen*Nsym);
+    Y = reshape(y, symLen, Nsym);
+    Y = Y(cpLen+1:end,:);
+    Xhat = fftshift(fft(Y,Nfft,1),1);
+    gridHat = Xhat(fftBins,:);
+    Hest = gridHat ./ txGrid;
+    Hest = mean(Hest,2);
+    Hest = repmat(Hest,1,Nsym);
+    gridEq = gridHat ./ (Hest + 1e-9);
+    symOut = gridEq(:);
+    idxHat = qamdemod(gridEq(:), M, 'UnitAveragePower', true);
+    bitsPerSym = log2(M);
+    bits = de2bi(idxHat, bitsPerSym, 'left-msb').';
+    bits = bits(:);
+end
+
+function h = buildMIMOChannelIR(txPos, rxPos, obj, fc, Fs, Nt, dAnt)
+    c = 3e8;
+    lambda = c/fc;
+    dv  = rxPos(:) - txPos(:);
+    d0  = norm(dv);
+    az0 = atan2(dv(2), dv(1));
+    sv0 = exp(1j*2*pi*dAnt*(0:Nt-1)'*sin(az0)) / sqrt(Nt);
+    a0  = friisAmp(d0,fc) * exp(-1j*2*pi*fc*d0/3e8);
+    h   = a0 * sv0;
+    K = min(3, numel(obj));
+    for i = 1:K
+        d1  = norm(obj(i).pos - txPos);
+        d2  = norm(rxPos - obj(i).pos);
+        d   = d1 + d2;
+        dv_r = obj(i).pos(:) - txPos(:);
+        az_r = atan2(dv_r(2), dv_r(1));
+        sv_r = exp(1j*2*pi*dAnt*(0:Nt-1)'*sin(az_r)) / sqrt(Nt);
+        a   = 0.25*friisAmp(d,fc) * exp(-1j*2*pi*fc*d/3e8);
+        h   = h + a * sv_r;
+    end
+end
+
+function amp = friisAmp(d,fc)
+    c=3e8;
+    amp = (c/(4*pi*fc*max(d,1e-6)));
+end
+
+function az = azimuthDeg2D(p1,p2)
+    v = p2 - p1;
+    az = atan2d(v(2), v(1));
+end
+
+function GdB = sectorBeamGain(beamAz, targetAz, bwDeg, Gmain_dB, Gside_dB)
+    d = wrapTo180(targetAz - beamAz);
+    if abs(d) <= bwDeg/2
+        GdB = Gmain_dB;
+    else
+        GdB = Gside_dB;
+    end
+end
+
+function p = intersectRays2D(p1, th1deg, p2, th2deg)
+    th1 = deg2rad(th1deg);
+    th2 = deg2rad(th2deg);
+    d1 = [cos(th1); sin(th1)];
+    d2 = [cos(th2); sin(th2)];
+    A = [d1, -d2];
+    b = (p2 - p1);
+    if abs(det(A)) < 1e-6
+        p = [NaN; NaN];
+        return;
+    end
+    t = A\b;
+    p = p1 + t(1)*d1;
+end
+
+function [rngEst, z, rxGrid] = senseRangeAndSlowSample(txTime, txGrid, bsPos, obj, fc, Fs, Tframe, Nfft, cpLen, NsSym, fftBins)
+    c = 3e8;
+    lambda = c/fc;
+    x = txTime(:);
+    N = numel(x);
+    rngEst = nan(1, numel(obj));
+    z      = nan(1, numel(obj));
+    n = (0:N-1).';
+    t = n/Fs;
+    echoTotal = zeros(N, 1);
+    for i = 1:numel(obj)
+        d   = norm(obj(i).pos - bsPos);
+        tau = 2*d/c;
+        n0  = round(tau*Fs);
+        if n0 >= N, continue; end
+        u_los = (obj(i).pos - bsPos) / max(d, 1e-9);
+        vRad  = dot(obj(i).vel, u_los);
+        fD    = 2*vRad/lambda;
+        %%%%
+        echo = zeros(N,1);
+        echo(n0+1:end) = x(1:end-n0) .* exp(1j*2*pi*fD*t(1:end-n0));
+        %%%%
+
+        phi_det = 2*pi*fc*(2*d/3e8);
+        echo = echo * (0.1*obj(i).rcs) * exp(1j*phi_det);
+        echoTotal = echoTotal + echo;
+        r = xcorr(echo, x);
+        [~,ix] = max(abs(r));
+        lag = ix - N;
+        tauHat = abs(lag)/Fs;
+        rngEst(i) = (tauHat*c)/2;
+        z(i) = r(ix);
+    end
+    need = (Nfft + cpLen) * NsSym;
+    if numel(echoTotal) < need
+        echoTotal = [echoTotal; zeros(need - numel(echoTotal), 1)];
+    end
+    Y      = reshape(echoTotal(1:need), Nfft+cpLen, NsSym);
+    Y      = Y(cpLen+1:end, :);
+    Xhat   = fftshift(fft(Y, Nfft, 1), 1);
+    rxGrid = Xhat(fftBins, :);
+end
+
+function [rdMap, range_axis, doppler_axis] = senseRangeDoppler2D(txGrid, rxGrid, Nfft, Nsc, fftBins, deltaF, NsSym, Tframe, cpLen, Fs)
+    c = 3e8;
+    H = rxGrid ./ (txGrid + 1e-12);
+    H_full = zeros(Nfft, NsSym);
+    H_full(fftBins, :) = H;
+    h_delay = ifft(H_full, Nfft, 1);
+    rdMap_complex = fft(h_delay, NsSym, 2);
+    rdMap_complex = fftshift(rdMap_complex, 2);
+    rdMap = abs(rdMap_complex);
+    range_res    = c / (2 * Nfft * deltaF);
+    range_axis   = (0:Nfft-1) * range_res;
+    Tsym         = (Nfft + cpLen) / Fs;
+    doppler_axis = (-NsSym/2 : NsSym/2-1) / (NsSym * Tsym);
+end
+
+function [bestBS, bestSR] = chooseSecureBS(userPos, eve, BS, Nt, dAnt, lambda, SNRlin)
+    bestBS = 1; bestSR = 0;
+    for b = 1:numel(BS)
+        sr = secrecyScore(b, userPos, eve, BS, Nt, dAnt, lambda, SNRlin);
+        if sr > bestSR
+            bestSR = sr; bestBS = b;
+        end
+    end
+end
+
+function SR = secrecyScore(txBS, userPos, eve, BS, Nt, dAnt, lambda, SNRlin)
+    Gtx_u = mimoGain(BS(txBS).pos, userPos, Nt, dAnt, lambda);
+    du    = norm(userPos - BS(txBS).pos);
+    sigU  = Gtx_u / max(du^2, 1e-6);
+    intU  = 0;
+    for jb = 1:numel(BS)
+        if jb == txBS, continue; end
+        Gjam_u = mimoGain(BS(jb).pos, userPos, Nt, dAnt, lambda);
+        dju    = norm(userPos - BS(jb).pos);
+        intU   = intU + 0.1*Gjam_u / max(dju^2, 1e-6);
+    end
+    Clegit  = log2(1 + (SNRlin*sigU) / (1 + SNRlin*intU));
+    CeveMax = 0;
+    for e = 1:numel(eve)
+        Gtx_e = mimoGain(BS(txBS).pos, eve(e).pos, Nt, dAnt, lambda);
+        de    = norm(eve(e).pos - BS(txBS).pos);
+        sigE  = Gtx_e / max(de^2, 1e-6);
+        intE  = 0;
+        for jb = 1:numel(BS)
+            if jb == txBS, continue; end
+            Gjam_e = mimoGain(BS(jb).pos, eve(e).pos, Nt, dAnt, lambda);
+            dje    = norm(eve(e).pos - BS(jb).pos);
+            intE   = intE + 0.1*Gjam_e / max(dje^2, 1e-6);
+        end
+        Ce      = log2(1 + (SNRlin*sigE) / (1 + SNRlin*intE));
+        CeveMax = max(CeveMax, Ce);
+    end
+    SR = max(Clegit - CeveMax, 0);
+end
+
+function gain = mimoGain(bsPos, targetPos, Nt, dAnt, lambda)
+    dv   = targetPos(:) - bsPos(:);
+    az   = atan2(dv(2), dv(1));
+    sv   = exp(1j*2*pi*dAnt*(0:Nt-1)'*sin(az));
+    sv   = sv / norm(sv);
+    gain = norm(sv)^2 * Nt;
+end

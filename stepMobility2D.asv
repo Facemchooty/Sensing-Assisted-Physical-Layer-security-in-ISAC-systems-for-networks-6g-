@@ -1,0 +1,22 @@
+function [users,obj] = stepMobility2D(users,obj,room,dt)
+
+    for i=1:numel(users)
+        users(i).pos = users(i).pos + users(i).vel*dt;
+        [users(i).pos, users(i).vel] = bounce2D(users(i).pos, users(i).vel, room);
+    end
+
+    for i=1:numel(obj)
+        obj(i).pos = obj(i).pos + obj(i).vel*dt;
+        [obj(i).pos, obj(i).vel] = bounce2D(obj(i).pos, obj(i).vel, room);
+    end
+
+end
+
+function [p,v] = bounce2D(p,v,room)
+
+    if p(1) < 0,      p(1)=0;      v(1)=-v(1); end
+    if p(1) > room.L, p(1)=room.L; v(1)=-v(1); end
+    if p(2) < 0,      p(2)=0;      v(2)=-v(2); end
+    if p(2) > room.W, p(2)=room.W; v(2)=-v(2); end
+
+end
